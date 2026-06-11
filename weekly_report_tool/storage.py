@@ -44,6 +44,10 @@ class StorageManager:
         with open(filepath, "w", encoding="utf-8") as f:
             json.dump(report.to_dict(), f, ensure_ascii=False, indent=2)
 
+    def has_report(self, week_start: str, member_name: str) -> bool:
+        filepath = self._get_report_file(week_start, member_name)
+        return os.path.exists(filepath)
+
     def load_report(self, week_start: str, member_name: str) -> Optional[WeeklyReport]:
         filepath = self._get_report_file(week_start, member_name)
         if not os.path.exists(filepath):

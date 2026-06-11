@@ -162,17 +162,24 @@ def parse_text_report(
 
     current_type: Optional[ItemType] = None
     current_section_lines: List[str] = []
+    current_section_project: str = ""
 
     for line in lines:
         stripped = line.strip()
         matched_type = None
         has_project_tag = bool(re.search(r'[【\[]', stripped))
         ends_with_colon = bool(re.search(r'[：:]\s*$', stripped))
-        cleaned_header = re.sub(r'^[一二三四五六七八九十\d]+[、\.\)：:\s]+', '', stripped)
-        cleaned_header = re.sub(r'^[#\*\-\s]+', '', cleaned_header)
-        header_only_keywords = len(cleaned_header) <= 15 or ends_with_colon
+
+        header_project = detect_project_name(stripped, known_projects) if has_project_tag else ""
+
+        header_without_project = re.sub(r'[【\[][^\]】]+[】\]]', '', stripped).strip()
+        header_without_project = re.sub(r'^[一二三四五六七八九十\d]+[、\.\)：:\s]+', '', header_without_project)
+        header_without_project = re.sub(r'^[#\*\-\s]+', '', header_without_project)
+
+        is_short_header = len(header_without_project) <= 15 or ends_with_colon
         if has_project_tag:
-            header_only_keywords = False
+            is_short_header = len(header_without_project) <= 6 and bool(header_without_project)
+
         for itype, keywords in SECTION_KEYWORDS.items():
             for kw in keywords:
                 kw_lower = kw.lower()
@@ -183,9 +190,12 @@ def parse_text_report(
                 if ends_with_colon:
                     matched_type = itype
                     break
-                if header_only_keywords:
-                    if (cleaned_header == kw or cleaned_header.lower() == kw_lower or
-                            kw in cleaned_header or kw_lower in cleaned_header.lower()):
+                if is_short_header:
+                    hdr = header_without_project if has_project_tag else stripped
+                    hdr_clean = re.sub(r'^[一二三四五六七八九十\d]+[、\.\)：:\s]+', '', hdr)
+                    hdr_clean = re.sub(r'^[#\*\-\s]+', '', hdr_clean)
+                    if (hdr_clean == kw or hdr_clean.lower() == kw_lower or
+                            kw in hdr_clean or kw_lower in hdr_clean.lower()):
                         matched_type = itype
                         break
             if matched_type:
@@ -195,9 +205,10 @@ def parse_text_report(
             if current_type is not None:
                 section_text = '\n'.join(current_section_lines)
                 items_text = _split_clean_items(section_text)
-                sections[current_type].extend(items_text)
+                sections[current_type].extend([(c, current_section_project) for c in items_text])
             current_type = matched_type
             current_section_lines = []
+            current_section_project = header_project
             colon_idx = max(stripped.find('：'), stripped.find(':'))
             if colon_idx > 0:
                 rest = stripped[colon_idx + 1:].strip()
@@ -209,12 +220,28 @@ def parse_text_report(
     if current_type is not None:
         section_text = '\n'.join(current_section_lines)
         items_text = _split_clean_items(section_text)
-        sections[current_type].extend(items_text)
+        sections[current_type].extend([(c, current_section_project) for c in items_text])
+
+    EMPTY_CONTENT_PATTERNS = [
+        r'^无$', r'^暂无$', r'^没有$', r'^none$', r'^n/a$', r'^na$',
+        r'^无。$', r'^暂无。$', r'^没有。$',
+    ]
 
     report_items: List[ReportItem] = []
     for itype, item_contents in sections.items():
-        for content in item_contents:
+        for content, section_project in item_contents:
+            content_stripped = content.strip()
+            is_empty = False
+            for pat in EMPTY_CONTENT_PATTERNS:
+                if re.match(pat, content_stripped, re.IGNORECASE):
+                    is_empty = True
+                    break
+            if is_empty:
+                continue
+
             project = detect_project_name(content, known_projects)
+            if not project and section_project:
+                project = section_project
             status, delay_reason = detect_status(content)
             deadline_match = re.search(
                 r'(?:截止|deadline|ddl)[：: ]?(\d{4}[-/\.]?\d{0,2}[-/\.]?\d{0,2})',

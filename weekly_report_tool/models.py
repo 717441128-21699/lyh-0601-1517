@@ -233,3 +233,37 @@ class TeamSummary:
             for itype in ItemType:
                 groups[member_name][itype] = report.get_items_by_type(itype)
         return groups
+
+    def group_items_by_owner(self, projects: List[Project]) -> Dict[str, Dict[str, List[ReportItem]]]:
+        owner_groups: Dict[str, Dict[str, List[ReportItem]]] = {}
+        project_owner_map: Dict[str, str] = {}
+        for p in projects:
+            if p.owner:
+                project_owner_map[p.name] = p.owner
+        for report in self.reports.values():
+            for item in report.items:
+                proj = item.project or "未分类"
+                owner = project_owner_map.get(proj, "未分配负责人")
+                if owner not in owner_groups:
+                    owner_groups[owner] = {}
+                if proj not in owner_groups[owner]:
+                    owner_groups[owner][proj] = []
+                owner_groups[owner][proj].append(item)
+        if "未分类" not in project_owner_map:
+            unassigned_projects = set()
+            for report in self.reports.values():
+                for item in report.items:
+                    if not item.project or item.project not in project_owner_map:
+                        unassigned_projects.add(item.project or "未分类")
+            if unassigned_projects:
+                owner = "未分配负责人"
+                if owner not in owner_groups:
+                    owner_groups[owner] = {}
+                for proj in unassigned_projects:
+                    if proj not in owner_groups[owner]:
+                        owner_groups[owner][proj] = []
+                    for report in self.reports.values():
+                        for item in report.items:
+                            if (item.project or "未分类") == proj:
+                                owner_groups[owner][proj].append(item)
+        return owner_groups
