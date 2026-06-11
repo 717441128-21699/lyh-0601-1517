@@ -1,5 +1,5 @@
 import re
-from typing import List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional
 from datetime import datetime, timedelta
 from .models import WeeklyReport, ReportItem, ItemType, ItemStatus
 
@@ -271,6 +271,146 @@ def parse_text_report(
     )
 
 
+TYPE_COLUMN_KEYWORDS = {
+    ItemType.COMPLETED: ["完成", "已完成", "本周完成", "本周工作", "done", "completed"],
+    ItemType.PLANNED: ["计划", "下周计划", "待办", "planned", "todo", "next"],
+    ItemType.RISK: ["风险", "阻塞", "风险阻塞", "问题", "risk", "block", "issue"],
+    ItemType.HELP: ["求助", "协助", "帮助", "help", "need", "assistance"],
+}
+
+HEADER_ALIASES = {
+    "name": ["姓名", "成员", "提交人", "汇报人", "name", "member"],
+    "week": ["周期", "周", "日期", "week", "date", "period"],
+    "project": ["项目", "项目名", "project"],
+    "type": ["类型", "分类", "type", "category"],
+    "content": ["内容", "描述", "事项", "content", "description", "detail"],
+    "status": ["状态", "status"],
+}
+
+
+def _detect_tabular_headers(row_values: list) -> Optional[dict]:
+    header_map = {}
+    for col_idx, val in enumerate(row_values):
+        if val is None:
+            continue
+        val_str = str(val).strip().lower()
+        if not val_str:
+            continue
+        for field, aliases in HEADER_ALIASES.items():
+            if field in header_map:
+                continue
+            for alias in aliases:
+                if alias == val_str or alias in val_str:
+                    header_map[field] = col_idx
+                    break
+    if "content" in header_map and len(header_map) >= 2:
+        return header_map
+    if "name" in header_map and "type" in header_map:
+        return header_map
+    if "name" in header_map and "content" in header_map:
+        return header_map
+    return None
+
+
+def _parse_type_from_value(val: str) -> Optional[ItemType]:
+    val_lower = val.strip().lower()
+    for itype, keywords in TYPE_COLUMN_KEYWORDS.items():
+        for kw in keywords:
+            if kw == val_lower or kw in val_lower:
+                return itype
+    return None
+
+
+def parse_excel_tabular(sheet, known_projects: Optional[List[str]] = None,
+                        default_week_start: Optional[str] = None) -> List[WeeklyReport]:
+    member_reports: Dict[str, WeeklyReport] = {}
+    header_map = None
+    default_week_end = None
+    if default_week_start:
+        try:
+            from datetime import datetime, timedelta
+            ws = datetime.strptime(default_week_start, "%Y-%m-%d")
+            default_week_end = (ws + timedelta(days=6)).strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+
+    for row in sheet.iter_rows(values_only=True):
+        row_strs = [str(c).strip() if c is not None else "" for c in row]
+        non_empty = [s for s in row_strs if s]
+        if not non_empty:
+            continue
+
+        if header_map is None:
+            candidate = _detect_tabular_headers(row)
+            if candidate:
+                header_map = candidate
+                continue
+            else:
+                continue
+
+        content_val = row_strs[header_map.get("content", -1)] if "content" in header_map else ""
+        if not content_val.strip():
+            continue
+
+        name_val = row_strs[header_map["name"]].strip() if "name" in header_map else ""
+        if not name_val:
+            continue
+
+        project_val = row_strs[header_map.get("project", -1)].strip() if "project" in header_map else ""
+        if not project_val and known_projects:
+            for kp in known_projects:
+                if kp in content_val:
+                    project_val = kp
+                    break
+
+        type_val = row_strs[header_map.get("type", -1)].strip() if "type" in header_map else ""
+        item_type = _parse_type_from_value(type_val) if type_val else ItemType.COMPLETED
+
+        if item_type is None:
+            item_type = ItemType.COMPLETED
+
+        week_val = row_strs[header_map.get("week", -1)].strip() if "week" in header_map else ""
+        week_start = default_week_start or ""
+        week_end = default_week_end or ""
+        if week_val:
+            ws, we = detect_week_dates(week_val, default_week_start)
+            week_start = ws
+            week_end = we
+
+        status_val = row_strs[header_map.get("status", -1)].strip() if "status" in header_map else ""
+        if status_val:
+            status_lower = status_val.lower()
+            if any(k in status_lower for k in ["阻塞", "blocked", "stuck"]):
+                item_status = ItemStatus.BLOCKED
+                delay_reason = ""
+            elif any(k in status_lower for k in ["延期", "延迟", "delayed", "late"]):
+                item_status = ItemStatus.DELAYED
+                delay_reason = ""
+            else:
+                item_status, delay_reason = detect_status(content_val)
+        else:
+            item_status, delay_reason = detect_status(content_val)
+
+        if name_val not in member_reports:
+            member_reports[name_val] = WeeklyReport(
+                member_name=name_val,
+                week_start=week_start,
+                week_end=week_end,
+                items=[]
+            )
+
+        member_reports[name_val].items.append(ReportItem(
+            item_type=item_type,
+            content=content_val,
+            project=project_val,
+            status=item_status,
+            delay_reason=delay_reason,
+            assignee=name_val
+        ))
+
+    return list(member_reports.values())
+
+
 def parse_excel_report(
     filepath: str,
     known_projects: Optional[List[str]] = None,
@@ -282,6 +422,17 @@ def parse_excel_report(
     default_name_hints = {"sheet", "sheet1", "sheet2", "sheet3", "工作表", "数据"}
 
     for sheet in wb.worksheets:
+        first_row = next(sheet.iter_rows(min_row=1, max_row=1, values_only=True), None)
+        header_map = _detect_tabular_headers(list(first_row)) if first_row else None
+
+        if header_map:
+            sheet_reports = parse_excel_tabular(
+                sheet, known_projects=known_projects,
+                default_week_start=default_week_start
+            )
+            reports.extend(sheet_reports)
+            continue
+
         text_parts = []
         for row in sheet.iter_rows(values_only=True):
             row_strs = [str(c).strip() for c in row if c is not None and str(c).strip()]

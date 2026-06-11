@@ -31,11 +31,13 @@ def _require_init(storage: StorageManager) -> Optional[TeamConfig]:
 
 \b
 常用流程：
-  1. init    初始化团队和项目配置（首次使用）
-  2. import  批量导入各成员周报
-  3. check   校验缺交/延期/阻塞情况
-  4. summary 生成汇总摘要，可追加负责人说明
-  5. export  导出为邮件/群公告/Markdown格式
+  1. init     初始化团队和项目配置（首次使用）
+  2. import   批量导入各成员周报
+  3. check    校验缺交/延期/阻塞情况
+  4. summary  生成汇总摘要，可追加负责人说明
+  5. export   导出为邮件/群公告/Markdown格式
+  6. history  查看周报历史版本
+  7. rollback 回滚到指定历史版本
 """,
     context_settings={"help_option_names": ["-h", "--help"]},
 )
@@ -240,6 +242,7 @@ def import_cmd(files, week: Optional[str], import_dir: Optional[str],
                 blocked = len(report.get_blocked_items())
 
                 if is_dup and action == "overwrite":
+                    storage.save_version(report.week_start, report.member_name)
                     status_str = click.style("↻", fg="yellow")
                     label = "覆盖"
                     overwrite_count += 1
@@ -267,8 +270,23 @@ def import_cmd(files, week: Optional[str], import_dir: Optional[str],
 
     if (success_count + overwrite_count) > 0:
         summary_file = storage._get_summary_file(week_start)
+        preserved_notes = ""
         if os.path.exists(summary_file):
+            old_summary = storage.load_summary(week_start)
+            if old_summary and old_summary.manual_notes:
+                preserved_notes = old_summary.manual_notes
             os.remove(summary_file)
+
+        if preserved_notes:
+            reports = storage.load_all_reports_for_week(week_start)
+            week_end_val = (datetime.strptime(week_start, "%Y-%m-%d") + timedelta(days=6)).strftime("%Y-%m-%d")
+            new_summary = TeamSummary(
+                week_start=week_start,
+                week_end=week_end_val,
+                reports=reports,
+                manual_notes=preserved_notes
+            )
+            storage.save_summary(new_summary)
 
     if not no_check and (success_count + overwrite_count) > 0:
         click.echo()
@@ -367,6 +385,10 @@ def _run_check(storage: StorageManager, config: TeamConfig,
         follow_up.add(name)
     summary.follow_up_members = sorted(list(follow_up))
 
+    old_summary = storage.load_summary(week_start)
+    if old_summary and old_summary.manual_notes:
+        summary.manual_notes = old_summary.manual_notes
+
     if save:
         storage.save_summary(summary)
 
@@ -378,25 +400,26 @@ def _run_check(storage: StorageManager, config: TeamConfig,
     return summary
 
 
-@cli.command(short_help="生成团队摘要（按项目/成员/负责人归类）")
+@cli.command(short_help="生成团队摘要（按项目/成员/负责人/风险归类）")
 @click.option("-w", "--week", default=None,
               help="周起始日期 (YYYY-MM-DD)，默认本周一")
 @click.option("-g", "--group-by", default="project",
-              type=click.Choice(["project", "member", "owner"]),
-              help="归类维度：project(按项目) / member(按成员) / owner(按项目负责人)")
+              type=click.Choice(["project", "member", "owner", "risk"]),
+              help="归类维度：project(按项目) / member(按成员) / owner(按项目负责人) / risk(按风险等级)")
 @click.option("--add-note", is_flag=True,
               help="追加人工说明到摘要中（供导出使用）")
 @click.option("--brief", is_flag=True,
               help="只显示总体统计和重点关注，不展开所有条目")
 def summary(week: Optional[str], group_by: str, add_note: bool, brief: bool):
     """
-    生成团队周报摘要，支持三种归类视角，可追加负责人人工说明。
+    生成团队周报摘要，支持四种归类视角，可追加负责人人工说明。
 
     \b
     归类维度：
     - project：按项目归类（默认），适合项目负责人看整体进展
     - member：按成员归类，适合逐个了解成员工作
     - owner：按项目负责人归类，负责人能直接看到自己名下所有项目的进展、风险和求助
+    - risk：按风险等级归类，把延期、阻塞、求助按负责人和成员列出，一眼看到谁需要跟进
 
     追加的人工说明会在导出邮件/群公告/Markdown时，放在开头显眼位置。
     """
@@ -474,6 +497,8 @@ def summary(week: Optional[str], group_by: str, add_note: bool, brief: bool):
         _print_summary_by_member(summary_data)
     elif group_by == "owner":
         _print_summary_by_owner(summary_data, config.projects)
+    elif group_by == "risk":
+        _print_summary_by_risk(summary_data, config.projects)
 
     if summary_data.follow_up_members:
         click.echo(click.style(f"\n【需要跟进人员】", fg="red", bold=True))
@@ -595,6 +620,47 @@ def _print_summary_by_owner(summary_data: TeamSummary, projects: List[Project]):
                     click.echo(f"    🆘 {it.assignee}: {it.content}")
             else:
                 click.echo(f"  【{proj_name}】进展顺利")
+
+
+def _print_summary_by_risk(summary_data: TeamSummary, projects: List[Project]):
+    risk_groups = summary_data.group_items_by_risk(projects)
+    click.echo(click.style("\n【按风险等级分类】", fg="red", bold=True))
+
+    if not risk_groups:
+        click.echo(click.style("  ✓ 本周无延期、阻塞或求助事项", fg="green"))
+        return
+
+    cat_config = {
+        "阻塞": {"icon": "🚫", "color": "red"},
+        "延期": {"icon": "⚠️", "color": "yellow"},
+        "求助": {"icon": "🆘", "color": "magenta"},
+    }
+
+    for cat_name in ["阻塞", "延期", "求助"]:
+        if cat_name not in risk_groups:
+            continue
+        cfg = cat_config[cat_name]
+        cat_items = risk_groups[cat_name]
+        total_count = sum(len(items) for items in cat_items.values())
+        click.echo(click.style(
+            f"\n  {cfg['icon']} {cat_name} ({total_count}项)", fg=cfg["color"], bold=True
+        ))
+        for key in sorted(cat_items.keys()):
+            items = cat_items[key]
+            click.echo(click.style(f"    [{key}] ({len(items)}项)", fg="cyan"))
+            for it in items:
+                proj = f"[{it.project}] " if it.project else ""
+                reason = f"（原因：{it.delay_reason}）" if it.delay_reason else ""
+                click.echo(f"      - {proj}{it.content}{reason}")
+
+    all_risk_members = set()
+    for cat_items in risk_groups.values():
+        for key in cat_items.keys():
+            parts = key.split(" / ")
+            if len(parts) >= 2:
+                all_risk_members.add(parts[-1])
+    if all_risk_members:
+        click.echo(click.style(f"\n  需重点跟进人员：{', '.join(sorted(all_risk_members))}", fg="red", bold=True))
 
 
 @cli.command(short_help="导出周报（邮件/群公告/Markdown）")
@@ -935,6 +1001,103 @@ def _format_markdown(config: TeamConfig, s: TeamSummary) -> str:
     lines.append("")
     lines.append(f"_本报表由团队周报汇总工具自动生成  |  {s.week_start} ~ {s.week_end}_")
     return "\n".join(lines)
+
+
+@cli.command("history", short_help="查看周报历史版本")
+@click.option("-w", "--week", default=None,
+              help="周起始日期 (YYYY-MM-DD)，默认本周一")
+@click.option("-m", "--member", default=None,
+              help="指定成员名称，不填则列出所有成员的版本")
+def history_cmd(week: Optional[str], member: Optional[str]):
+    """
+    查看周报的历史版本记录。
+
+    覆盖导入时会自动保存旧版本，通过此命令可以查看历史。
+    配合 rollback 命令可以回滚到指定版本。
+
+    \b
+    用法：
+      python main.py history -w 2026-06-08          # 查看所有成员的版本
+      python main.py history -w 2026-06-08 -m 张三   # 只看张三的版本
+    """
+    storage = StorageManager()
+    config = _require_init(storage)
+    if config is None:
+        return
+
+    week_start = week or _get_default_week()
+    click.echo(click.style(f"\n=== 历史版本 ({week_start}) ===", fg="cyan", bold=True))
+
+    if member:
+        members = [member]
+    else:
+        members = config.member_names()
+        reports = storage.load_all_reports_for_week(week_start)
+        for m in reports:
+            if m not in members:
+                members.append(m)
+
+    found_any = False
+    for m in members:
+        versions = storage.list_versions(week_start, m)
+        if not versions:
+            continue
+        found_any = True
+        click.echo(click.style(f"\n▸ {m}", fg="green", bold=True))
+        for v in versions:
+            click.echo(f"  版本: {v['version_id']}  |  "
+                       f"提交时间: {v['submitted_at'] or '未知'}  |  "
+                       f"条目数: {v['item_count']}")
+
+    if not found_any:
+        click.echo("  暂无历史版本（覆盖导入时会自动保存旧版本）")
+
+
+@cli.command("rollback", short_help="回滚周报到指定历史版本")
+@click.option("-w", "--week", default=None,
+              help="周起始日期 (YYYY-MM-DD)，默认本周一")
+@click.option("-m", "--member", required=True,
+              help="要回滚的成员名称")
+@click.option("-v", "--version", "version_id", required=True,
+              help="要回滚到的版本ID（通过 history 命令查看）")
+def rollback_cmd(week: Optional[str], member: str, version_id: str):
+    """
+    回滚指定成员的周报到历史版本。
+
+    覆盖导入前的旧版本会被自动保存，回滚后 summary 和 export 会使用旧内容。
+
+    \b
+    用法：
+      python main.py history -w 2026-06-08 -m 张三    # 先查看版本列表
+      python main.py rollback -w 2026-06-08 -m 张三 -v 20260608_143022  # 回滚到指定版本
+    """
+    storage = StorageManager()
+    config = _require_init(storage)
+    if config is None:
+        return
+
+    week_start = week or _get_default_week()
+    click.echo(click.style(f"\n=== 回滚周报 ({week_start}) ===", fg="cyan", bold=True))
+
+    versions = storage.list_versions(week_start, member)
+    target = None
+    for v in versions:
+        if v["version_id"] == version_id:
+            target = v
+            break
+
+    if target is None:
+        click.echo(click.style(f"错误：找不到版本 {version_id}，请通过 history 命令查看可用版本", fg="red"))
+        return
+
+    storage.save_version(week_start, member)
+
+    if storage.rollback_report(week_start, member, version_id):
+        click.echo(click.style(f"✓ {member} 的周报已回滚到版本 {version_id}", fg="green"))
+        click.echo(f"  版本提交时间: {target['submitted_at'] or '未知'}，条目数: {target['item_count']}")
+        click.echo(f"  回滚前的版本已自动保存，可通过 history 查看")
+    else:
+        click.echo(click.style(f"回滚失败", fg="red"))
 
 
 def main():

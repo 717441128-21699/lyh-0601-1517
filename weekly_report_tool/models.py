@@ -250,3 +250,28 @@ class TeamSummary:
                     owner_groups[owner][proj] = []
                 owner_groups[owner][proj].append(item)
         return owner_groups
+
+    def group_items_by_risk(self, projects: List[Project]) -> Dict[str, Dict[str, List[ReportItem]]]:
+        risk_groups: Dict[str, Dict[str, List[ReportItem]]] = {}
+        project_owner_map: Dict[str, str] = {}
+        for p in projects:
+            if p.owner:
+                project_owner_map[p.name] = p.owner
+        risk_categories = [
+            ("延期", lambda it: it.status == ItemStatus.DELAYED),
+            ("阻塞", lambda it: it.status == ItemStatus.BLOCKED),
+            ("求助", lambda it: it.item_type == ItemType.HELP),
+        ]
+        for cat_name, cat_filter in risk_categories:
+            cat_items: Dict[str, List[ReportItem]] = {}
+            for member_name, report in self.reports.items():
+                for item in report.items:
+                    if cat_filter(item):
+                        owner = project_owner_map.get(item.project, "未分配负责人") if item.project else "未分配负责人"
+                        key = f"{owner} / {member_name}"
+                        if key not in cat_items:
+                            cat_items[key] = []
+                        cat_items[key].append(item)
+            if cat_items:
+                risk_groups[cat_name] = cat_items
+        return risk_groups
