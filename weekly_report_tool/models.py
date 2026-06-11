@@ -249,21 +249,4 @@ class TeamSummary:
                 if proj not in owner_groups[owner]:
                     owner_groups[owner][proj] = []
                 owner_groups[owner][proj].append(item)
-        if "未分类" not in project_owner_map:
-            unassigned_projects = set()
-            for report in self.reports.values():
-                for item in report.items:
-                    if not item.project or item.project not in project_owner_map:
-                        unassigned_projects.add(item.project or "未分类")
-            if unassigned_projects:
-                owner = "未分配负责人"
-                if owner not in owner_groups:
-                    owner_groups[owner] = {}
-                for proj in unassigned_projects:
-                    if proj not in owner_groups[owner]:
-                        owner_groups[owner][proj] = []
-                    for report in self.reports.values():
-                        for item in report.items:
-                            if (item.project or "未分类") == proj:
-                                owner_groups[owner][proj].append(item)
         return owner_groups

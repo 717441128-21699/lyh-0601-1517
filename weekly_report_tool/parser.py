@@ -91,8 +91,7 @@ def detect_status(content: str) -> Tuple[ItemStatus, str]:
         status = ItemStatus.BLOCKED
     else:
         for kw in BLOCK_KEYWORDS:
-            pattern = r'(^|[，。,\.;；\s\-（\(])' + re.escape(kw) + r'([：:，。,\.;；\s\-）\)]|$)'
-            if re.search(pattern, content) or re.search(pattern, content_lower):
+            if kw in content or kw in content_lower:
                 status = ItemStatus.BLOCKED
                 break
     if status == ItemStatus.NORMAL:
@@ -101,8 +100,7 @@ def detect_status(content: str) -> Tuple[ItemStatus, str]:
         else:
             delay_found = False
             for kw in DELAY_KEYWORDS:
-                pattern = r'(^|[，。,\.;；\s\-（\(])' + re.escape(kw) + r'([：:，。,\.;；\s\-）\)]|$)'
-                if re.search(pattern, content) or re.search(pattern, content_lower):
+                if kw in content or kw in content_lower:
                     delay_found = True
                     break
             if delay_found:
@@ -281,25 +279,33 @@ def parse_excel_report(
     from openpyxl import load_workbook
     wb = load_workbook(filepath, data_only=True)
     reports: List[WeeklyReport] = []
+    default_name_hints = {"sheet", "sheet1", "sheet2", "sheet3", "工作表", "数据"}
 
     for sheet in wb.worksheets:
         text_parts = []
         for row in sheet.iter_rows(values_only=True):
-            row_strs = [str(c) for c in row if c is not None and str(c).strip()]
+            row_strs = [str(c).strip() for c in row if c is not None and str(c).strip()]
             if row_strs:
                 text_parts.append(" | ".join(row_strs))
 
         text = "\n".join(text_parts)
         if not text.strip():
             continue
+
         report = parse_text_report(
             text,
             filename=os.path.basename(filepath),
             known_projects=known_projects,
             default_week_start=default_week_start
         )
-        if report.member_name == "未知成员" and sheet.title and sheet.title != "Sheet":
-            report.member_name = sheet.title
+
+        sheet_title = sheet.title.strip() if sheet.title else ""
+        if report.member_name == "未知成员" and sheet_title and sheet_title.lower() not in default_name_hints:
+            report.member_name = sheet_title
+
+        if len(report.items) == 0 and report.member_name == "未知成员":
+            continue
+
         reports.append(report)
 
     return reports

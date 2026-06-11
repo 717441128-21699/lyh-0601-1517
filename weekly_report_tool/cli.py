@@ -1,5 +1,5 @@
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import List, Optional
 import click
 import os
 import sys
@@ -264,6 +264,11 @@ def import_cmd(files, week: Optional[str], import_dir: Optional[str],
     click.echo()
     click.echo(click.style("导入完成：", fg="cyan", bold=True) +
                f"新增 {success_count} 份，覆盖 {overwrite_count} 份，跳过 {skip_count} 份，失败 {fail_count} 份")
+
+    if (success_count + overwrite_count) > 0:
+        summary_file = storage._get_summary_file(week_start)
+        if os.path.exists(summary_file):
+            os.remove(summary_file)
 
     if not no_check and (success_count + overwrite_count) > 0:
         click.echo()
