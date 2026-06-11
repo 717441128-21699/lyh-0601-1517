@@ -275,3 +275,38 @@ class TeamSummary:
             if cat_items:
                 risk_groups[cat_name] = cat_items
         return risk_groups
+
+    def filtered_copy(self, projects: List[Project] = None,
+                       owner: str = None, project_name: str = None) -> "TeamSummary":
+        from copy import deepcopy
+        new_summary = TeamSummary(
+            week_start=self.week_start,
+            week_end=self.week_end,
+            reports={},
+            missing_members=self.missing_members,
+            manual_notes=self.manual_notes,
+            follow_up_members=self.follow_up_members
+        )
+
+        project_owner_map = {}
+        if projects:
+            for p in projects:
+                if p.owner:
+                    project_owner_map[p.name] = p.owner
+
+        for member_name, report in self.reports.items():
+            new_items = []
+            for item in report.items:
+                if project_name and item.project != project_name:
+                    continue
+                if owner:
+                    item_owner = project_owner_map.get(item.project, "未分配负责人") if item.project else "未分配负责人"
+                    if item_owner != owner:
+                        continue
+                new_items.append(deepcopy(item))
+            if new_items:
+                new_report = deepcopy(report)
+                new_report.items = new_items
+                new_summary.reports[member_name] = new_report
+
+        return new_summary

@@ -1,6 +1,7 @@
 import os
 import json
 import shutil
+import zipfile
 from typing import Optional, List
 from datetime import datetime
 from .models import TeamConfig, TeamSummary, WeeklyReport
@@ -101,8 +102,12 @@ class StorageManager:
         safe_name = member_name.replace(" ", "_")
         version_dir = os.path.join(self.versions_dir, f"{safe_week}_{safe_name}")
         os.makedirs(version_dir, exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
         version_file = os.path.join(version_dir, f"v_{timestamp}.json")
+        counter = 1
+        while os.path.exists(version_file):
+            version_file = os.path.join(version_dir, f"v_{timestamp}_{counter}.json")
+            counter += 1
         shutil.copy2(report_file, version_file)
         return True
 
@@ -143,3 +148,80 @@ class StorageManager:
         if os.path.exists(summary_file):
             os.remove(summary_file)
         return True
+
+    def create_archive(self, week_start: str, team_name: str = "",
+                       output_dir: Optional[str] = None,
+                       create_zip: bool = False) -> str:
+        safe_week = week_start.replace("-", "")
+        archive_name = f"{team_name}周报归档_{week_start}" if team_name else f"周报归档_{week_start}"
+        archive_name = archive_name.replace(" ", "_")
+
+        if output_dir is None:
+            output_dir = os.path.join(self.base_dir, "weekly_archives")
+        os.makedirs(output_dir, exist_ok=True)
+
+        archive_path = os.path.join(output_dir, archive_name)
+        if os.path.exists(archive_path):
+            shutil.rmtree(archive_path)
+
+        reports_dir = os.path.join(archive_path, "原始周报")
+        versions_dir_out = os.path.join(archive_path, "历史版本")
+        summary_dir_out = os.path.join(archive_path, "汇总摘要")
+        exports_dir_out = os.path.join(archive_path, "导出文件")
+        os.makedirs(reports_dir, exist_ok=True)
+        os.makedirs(versions_dir_out, exist_ok=True)
+        os.makedirs(summary_dir_out, exist_ok=True)
+        os.makedirs(exports_dir_out, exist_ok=True)
+
+        if os.path.isdir(self.data_dir):
+            for fname in os.listdir(self.data_dir):
+                if fname.startswith(safe_week) and fname.endswith(".json"):
+                    shutil.copy2(os.path.join(self.data_dir, fname),
+                                 os.path.join(reports_dir, fname))
+
+        if os.path.isdir(self.versions_dir):
+            for dname in os.listdir(self.versions_dir):
+                if dname.startswith(safe_week):
+                    src = os.path.join(self.versions_dir, dname)
+                    dst = os.path.join(versions_dir_out, dname)
+                    if os.path.isdir(src):
+                        shutil.copytree(src, dst)
+
+        summary_file = self._get_summary_file(week_start)
+        if os.path.exists(summary_file):
+            shutil.copy2(summary_file, os.path.join(summary_dir_out, os.path.basename(summary_file)))
+
+        if os.path.isdir(self.export_dir):
+            week_tag = safe_week
+            for fname in os.listdir(self.export_dir):
+                if week_tag in fname:
+                    shutil.copy2(os.path.join(self.export_dir, fname),
+                                 os.path.join(exports_dir_out, fname))
+
+        config_file = self.config_file
+        if os.path.exists(config_file):
+            shutil.copy2(config_file, os.path.join(archive_path, "config.json"))
+
+        readme_path = os.path.join(archive_path, "README.txt")
+        with open(readme_path, "w", encoding="utf-8") as f:
+            f.write(f"团队周报归档\n")
+            f.write(f"周起始日期: {week_start}\n")
+            f.write(f"归档时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"\n目录说明:\n")
+            f.write(f"  原始周报/    各成员周报 JSON 数据\n")
+            f.write(f"  历史版本/    各成员周报历史版本\n")
+            f.write(f"  汇总摘要/    TeamSummary 摘要文件\n")
+            f.write(f"  导出文件/    导出的邮件/群公告/Markdown 文件\n")
+            f.write(f"  config.json  团队配置\n")
+
+        if create_zip:
+            zip_path = archive_path + ".zip"
+            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                for root, dirs, files in os.walk(archive_path):
+                    for fname in files:
+                        full_path = os.path.join(root, fname)
+                        arcname = os.path.relpath(full_path, os.path.dirname(archive_path))
+                        zf.write(full_path, arcname)
+            return zip_path
+
+        return archive_path

@@ -3,6 +3,7 @@ from typing import List, Optional
 import click
 import os
 import sys
+import json
 
 from .models import (
     TeamConfig, TeamSummary, WeeklyReport, Member, Project,
@@ -37,7 +38,9 @@ def _require_init(storage: StorageManager) -> Optional[TeamConfig]:
   4. summary  生成汇总摘要，可追加负责人说明
   5. export   导出为邮件/群公告/Markdown格式
   6. history  查看周报历史版本
-  7. rollback 回滚到指定历史版本
+  7. diff     对比周报版本差异
+  8. rollback 回滚到指定历史版本
+  9. archive  按周期打包归档
 """,
     context_settings={"help_option_names": ["-h", "--help"]},
 )
@@ -236,11 +239,6 @@ def import_cmd(files, week: Optional[str], import_dir: Optional[str],
                     skip_count += 1
                     continue
 
-                storage.save_report(report)
-                item_count = len(report.items)
-                delayed = len(report.get_delayed_items())
-                blocked = len(report.get_blocked_items())
-
                 if is_dup and action == "overwrite":
                     storage.save_version(report.week_start, report.member_name)
                     status_str = click.style("↻", fg="yellow")
@@ -250,6 +248,11 @@ def import_cmd(files, week: Optional[str], import_dir: Optional[str],
                     status_str = click.style("✓", fg="green")
                     label = "新增"
                     success_count += 1
+
+                storage.save_report(report)
+                item_count = len(report.items)
+                delayed = len(report.get_delayed_items())
+                blocked = len(report.get_blocked_items())
 
                 extra = ""
                 if delayed:
@@ -410,7 +413,12 @@ def _run_check(storage: StorageManager, config: TeamConfig,
               help="追加人工说明到摘要中（供导出使用）")
 @click.option("--brief", is_flag=True,
               help="只显示总体统计和重点关注，不展开所有条目")
-def summary(week: Optional[str], group_by: str, add_note: bool, brief: bool):
+@click.option("--owner", default=None,
+              help="只看指定负责人名下的项目")
+@click.option("--project", "project_name", default=None,
+              help="只看指定项目")
+def summary(week: Optional[str], group_by: str, add_note: bool, brief: bool,
+            owner: Optional[str], project_name: Optional[str]):
     """
     生成团队周报摘要，支持四种归类视角，可追加负责人人工说明。
 
@@ -442,6 +450,19 @@ def summary(week: Optional[str], group_by: str, add_note: bool, brief: bool):
             week_end=week_end,
             reports=reports
         )
+
+    if owner or project_name:
+        summary_data = summary_data.filtered_copy(
+            projects=config.projects,
+            owner=owner,
+            project_name=project_name
+        )
+        filter_info = []
+        if owner:
+            filter_info.append(f"负责人={owner}")
+        if project_name:
+            filter_info.append(f"项目={project_name}")
+        click.echo(click.style(f"筛选：{', '.join(filter_info)}", fg="yellow"))
 
     if add_note:
         click.echo("请输入人工说明（输入空行结束）：")
@@ -674,7 +695,12 @@ def _print_summary_by_risk(summary_data: TeamSummary, projects: List[Project]):
               help="输出目录，默认 weekly_exports/")
 @click.option("--filename", default=None,
               help="自定义文件名前缀（不含扩展名和日期）")
-def export(week: Optional[str], fmt: str, output_dir: Optional[str], filename: Optional[str]):
+@click.option("--owner", default=None,
+              help="只导出指定负责人名下的项目")
+@click.option("--project", "project_name", default=None,
+              help="只导出指定项目")
+def export(week: Optional[str], fmt: str, output_dir: Optional[str],
+           filename: Optional[str], owner: Optional[str], project_name: Optional[str]):
     """
     导出周报，支持邮件格式、群公告格式和 Markdown 格式。
 
@@ -706,6 +732,13 @@ def export(week: Optional[str], fmt: str, output_dir: Optional[str], filename: O
             week_start=week_start,
             week_end=week_end,
             reports=reports
+        )
+
+    if owner or project_name:
+        summary_data = summary_data.filtered_copy(
+            projects=config.projects,
+            owner=owner,
+            project_name=project_name
         )
 
     if output_dir:
@@ -1098,6 +1131,182 @@ def rollback_cmd(week: Optional[str], member: str, version_id: str):
         click.echo(f"  回滚前的版本已自动保存，可通过 history 查看")
     else:
         click.echo(click.style(f"回滚失败", fg="red"))
+
+
+def _diff_reports(old_report: "WeeklyReport", new_report: "WeeklyReport") -> dict:
+    from .models import ItemType
+    diff = {}
+    for itype in ItemType:
+        old_items = old_report.get_items_by_type(itype)
+        new_items = new_report.get_items_by_type(itype)
+        old_contents = {it.content: it for it in old_items}
+        new_contents = {it.content: it for it in new_items}
+
+        added = [new_contents[c] for c in new_contents if c not in old_contents]
+        removed = [old_contents[c] for c in old_contents if c not in new_contents]
+        modified = []
+        common = [c for c in new_contents if c in old_contents]
+        for c in common:
+            old_it = old_contents[c]
+            new_it = new_contents[c]
+            if old_it.status != new_it.status or old_it.delay_reason != new_it.delay_reason:
+                modified.append((old_it, new_it))
+
+        diff[itype] = {
+            "added": added,
+            "removed": removed,
+            "modified": modified,
+            "old_count": len(old_items),
+            "new_count": len(new_items),
+        }
+    return diff
+
+
+@cli.command("diff", short_help="对比周报版本差异")
+@click.option("-w", "--week", default=None,
+              help="周起始日期 (YYYY-MM-DD)，默认本周一")
+@click.option("-m", "--member", required=True,
+              help="要对比的成员名称")
+@click.option("-v", "--version", "version_id", default=None,
+              help="要对比的历史版本ID（不填则对比当前版本与上一版）")
+def diff_cmd(week: Optional[str], member: str, version_id: Optional[str]):
+    """
+    对比某个成员周报的两个版本差异。
+
+    按本周完成、下周计划、风险阻塞、求助需求四类分别显示新增、删除、修改的事项。
+
+    \b
+    用法：
+      python main.py diff -w 2026-06-08 -m 张三              # 对比当前与上一版
+      python main.py diff -w 2026-06-08 -m 张三 -v <版本ID>  # 对比当前与指定版本
+    """
+    storage = StorageManager()
+    config = _require_init(storage)
+    if config is None:
+        return
+
+    week_start = week or _get_default_week()
+    current = storage.load_report(week_start, member)
+    if current is None:
+        click.echo(click.style(f"错误：{member} 本周没有周报", fg="red"))
+        return
+
+    versions = storage.list_versions(week_start, member)
+    if not versions:
+        click.echo(click.style(f"{member} 没有历史版本", fg="yellow"))
+        return
+
+    target_version = None
+    if version_id:
+        for v in versions:
+            if v["version_id"] == version_id:
+                target_version = v
+                break
+        if target_version is None:
+            click.echo(click.style(f"错误：找不到版本 {version_id}", fg="red"))
+            return
+    else:
+        target_version = versions[0]
+
+    old_report = WeeklyReport.from_dict(json.load(open(target_version["filepath"], encoding="utf-8")))
+
+    diff = _diff_reports(old_report, current)
+
+    click.echo(click.style(f"\n=== {member} 周报差异对比", fg="cyan", bold=True))
+    click.echo(f"  对比版本: {target_version['version_id']} "
+               f"({target_version['submitted_at'] or '未知'}, {target_version['item_count']}项)")
+    click.echo(f"  当前版本: {len(current.items)} 项")
+    click.echo()
+
+    type_labels = {
+        "completed": ("本周完成", "green"),
+        "planned": ("下周计划", "blue"),
+        "risk": ("风险阻塞", "yellow"),
+        "help": ("求助需求", "magenta"),
+    }
+
+    for itype, data in diff.items():
+        label, color = type_labels[itype.value]
+        added = len(data["added"])
+        removed = len(data["removed"])
+        modified = len(data["modified"])
+
+        if added == 0 and removed == 0 and modified == 0:
+            continue
+
+        click.echo(click.style(f"【{label}】(+{added}/-{removed}/~{modified})", fg=color, bold=True))
+
+        if data["added"]:
+            click.echo(click.style(f"  新增 {added} 项:", fg="green"))
+            for it in data["added"]:
+                proj = f"[{it.project}] " if it.project else ""
+                click.echo(f"    + {proj}{it.content}")
+
+        if data["removed"]:
+            click.echo(click.style(f"  删除 {len(data['removed'])} 项:", fg="red"))
+            for it in data["removed"]:
+                proj = f"[{it.project}] " if it.project else ""
+                click.echo(f"    - {proj}{it.content}")
+
+        if data["modified"]:
+            click.echo(click.style(f"  修改 {len(data['modified'])} 项:", fg="yellow"))
+            for old_it, new_it in data["modified"]:
+                proj = f"[{new_it.project}] " if new_it.project else ""
+                old_status = old_it.status.value if old_it.status.value != "normal" else ""
+                new_status = new_it.status.value if new_it.status.value != "normal" else ""
+                status_change = f" [{old_status} → {new_status}]" if old_status != new_status else ""
+                click.echo(f"    ~ {proj}{new_it.content}{status_change}")
+
+        click.echo()
+
+
+@cli.command("archive", short_help="按周期打包归档周报")
+@click.option("-w", "--week", default=None,
+              help="周起始日期 (YYYY-MM-DD)，默认本周一")
+@click.option("-o", "--output-dir", default=None,
+              help="归档输出目录，默认为 weekly_archives/")
+@click.option("--zip", "create_zip", is_flag=True,
+              help="同时生成 zip 压缩包")
+def archive_cmd(week: Optional[str], output_dir: Optional[str], create_zip: bool):
+    """
+    按周期打包归档一周的所有周报数据。
+
+    归档内容包括：原始周报、历史版本、汇总摘要、导出文件、团队配置。
+    方便项目结束后留档备查。
+
+    \b
+    用法：
+      python main.py archive -w 2026-06-08           # 归档为目录
+      python main.py archive -w 2026-06-08 --zip       # 同时生成 zip 包
+      python main.py archive -w 2026-06-08 -o ./archive  # 指定输出目录
+    """
+    storage = StorageManager()
+    config = _require_init(storage)
+    if config is None:
+        return
+
+    week_start = week or _get_default_week()
+    click.echo(click.style(f"\n=== 周报归档 ({week_start}) ===", fg="cyan", bold=True))
+
+    result = storage.create_archive(
+        week_start=week_start,
+        team_name=config.team_name,
+        output_dir=output_dir,
+        create_zip=create_zip
+    )
+
+    if create_zip:
+        click.echo(click.style("✓ 归档完成", fg="green"))
+        click.echo(f"  压缩包: {result}")
+        size_kb = os.path.getsize(result) / 1024
+        click.echo(f"  文件大小: {size_kb:.1f} KB")
+    else:
+        click.echo(click.style("✓ 归档完成", fg="green"))
+        click.echo(f"  目录: {result}")
+        item_count = sum(len(files) for _, _, files in os.walk(result))
+        click.echo(f"  文件数: {item_count} 个")
+
+    click.echo(f"  包含内容: 原始周报、历史版本、汇总摘要、导出文件、团队配置")
 
 
 def main():
